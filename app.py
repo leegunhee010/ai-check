@@ -472,7 +472,13 @@ label{font-size:13px;color:var(--sub)}
 </div>
 
 <div class="card" id="dash" style="display:none">
- <div style="font-weight:700;margin-bottom:12px">📊 대시보드</div>
+ <div class="row" style="margin-bottom:12px">
+  <span style="font-weight:700">📊 대시보드</span>
+  <button onclick="load().then(()=>flashDash())" style="padding:4px 10px;font-size:12px">🔄 새로고침</button>
+  <span id="dashTime" style="font-size:11px;color:#9ca3af"></span>
+  <span style="flex:1"></span>
+  <span style="font-size:11px;color:#9ca3af">2초마다 자동 갱신됨</span>
+ </div>
  <div id="dashStats" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px"></div>
  <div style="display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start">
   <div id="dashDonuts" style="display:flex;gap:20px"></div>
@@ -525,6 +531,13 @@ let STATE=null;
 async function load(){
   STATE = await (await fetch('/api/state')).json();
   renderSettings(); renderTable(); renderStatus(); renderDash();
+  const t=document.getElementById('dashTime');
+  if(t)t.textContent='마지막 갱신 '+new Date().toLocaleTimeString('ko-KR');
+}
+function flashDash(){
+  const d=document.getElementById('dash');
+  d.style.transition='background .15s'; d.style.background='#eff6ff';
+  setTimeout(()=>{d.style.background='';},300);
 }
 
 // ── 📊 대시보드 ──────────────────────────────────────────
