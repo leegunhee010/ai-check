@@ -10,7 +10,7 @@ AI노출체크 — 구글 AI 개요 브랜드 노출 측정 GUI
 실행: python app.py → 브라우저 http://127.0.0.1:5610
 """
 import os, sys, json, csv, io, time, threading, webbrowser, datetime, socket
-import importlib.util
+import importlib.util, urllib.request, urllib.parse
 from flask import Flask, request, jsonify, Response
 
 FROZEN = getattr(sys, "frozen", False)
@@ -65,6 +65,48 @@ def load_settings():
     }
 
 
+# ── Supabase 중앙 공유 (AI노출체크 전용 프로젝트) ──
+# anon 키(공개용·RLS로 ai_measurements 테이블만 허용). 설정 supabase_url/key로 override 가능.
+SUPABASE_URL = "https://ryeooxioxpmdkttgvdzh.supabase.co"
+SUPABASE_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ5ZW9v"
+                "eGlveHBtZGt0dGd2ZHpoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzMTI5MjEsImV4cCI6MjA5"
+                "ODg4ODkyMX0.K2B_PK1oszMcwb9zzKzubZRsFlxSl-1O2YPOXcyt3BU")
+DEVICE = socket.gethostname()
+
+
+def _supa_cfg():
+    s = jload(SETTINGS_FILE, {})
+    return (s.get("supabase_url") or SUPABASE_URL), (s.get("supabase_key") or SUPABASE_KEY)
+
+
+def _supa(method, path, body=None, timeout=12):
+    url, key = _supa_cfg()
+    h = {"apikey": key, "Authorization": "Bearer " + key,
+         "Content-Type": "application/json"}
+    if method == "POST":
+        h["Prefer"] = "return=minimal"
+    req = urllib.request.Request(
+        url + path,
+        data=(json.dumps(body).encode("utf-8") if body is not None else None),
+        headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            t = r.read().decode("utf-8")
+            return json.loads(t) if t else True
+    except Exception:
+        return None      # 인터넷/테이블 문제면 조용히 스킵 (로컬 저장은 항상 됨)
+
+
+def _supa_push(question, cat, engine_key, res):
+    """측정 결과 요약을 중앙 DB에 기록 (백그라운드)"""
+    st = load_settings()
+    row = {"device": DEVICE, "brand": st["brand_name"], "category": cat,
+           "question": question, "engine": engine_key,
+           "n": res.get("n", 0), "aio_rate": res.get("aio_rate"),
+           "expose_rate": res.get("expose_rate"), "avg_rank": res.get("avg_rank")}
+    _supa("POST", "/rest/v1/ai_measurements", row)
+
+
 # ── 측정 실행 상태 (스레드 1개만) ─────────────────────────────
 RUN = {"active": False, "stop": False, "cur_q": "", "cur_i": 0, "cur_n": 0,
        "round": 0, "round_total": 0, "msg": "", "blocked": False, "engine": ""}
@@ -80,6 +122,11 @@ def _save_result(qid, engine_key, res):
         data = load_data()
         data["results"].setdefault(str(qid), {})[engine_key] = res
         jsave(DATA_FILE, data)
+    # 중앙 DB로 요약 전송 (실패해도 무시 — 로컬 저장은 위에서 완료)
+    cat = next((q["cat"] for q in data["questions"] if q["id"] == qid), "")
+    threading.Thread(target=_supa_push,
+                     args=(res.get("question", ""), cat, engine_key, dict(res)),
+                     daemon=True).start()
 
 
 def _worker(q_ids):
@@ -376,6 +423,20 @@ def api_reset_profile():
         return jsonify(ok=False, err=str(e))
 
 
+@app.get("/api/trend")
+def api_trend():
+    """중앙 DB에서 이 브랜드의 측정 이력 (추이 차트용)"""
+    st = load_settings()
+    rows = _supa("GET", "/rest/v1/ai_measurements"
+                 "?select=created_at,engine,expose_rate,aio_rate,category,question,device"
+                 "&brand=eq." + urllib.parse.quote(st["brand_name"])
+                 + "&order=created_at.asc&limit=2000")
+    if rows is None:
+        return jsonify(ok=False, rows=[],
+                       err="중앙 DB 연결 안 됨 (테이블 미생성 또는 오프라인)")
+    return jsonify(ok=True, rows=rows)
+
+
 @app.get("/api/export")
 def api_export():
     data = load_data()
@@ -429,6 +490,9 @@ button{border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer
 button.pri{background:var(--blue);color:#fff}
 button.warn{background:#fee2e2;color:var(--red)}
 button:disabled{opacity:.45;cursor:default}
+.tab{background:#eef1f5;border-radius:8px 8px 0 0;padding:8px 16px;font-size:13px;color:#6b7280}
+.tab.on{background:var(--blue);color:#fff;font-weight:700}
+.tab span{opacity:.7;font-size:11px;margin-left:4px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
 th{color:var(--sub);font-weight:600;font-size:12px;white-space:nowrap}
@@ -473,7 +537,7 @@ label{font-size:13px;color:var(--sub)}
 
 <div class="card" id="dash" style="display:none">
  <div class="row" style="margin-bottom:12px">
-  <span style="font-weight:700">📊 대시보드</span>
+  <span style="font-weight:700">📊 대시보드<span id="dashCat" style="color:#2563eb"></span></span>
   <button onclick="load().then(()=>flashDash())" style="padding:4px 10px;font-size:12px">🔄 새로고침</button>
   <span id="dashTime" style="font-size:11px;color:#9ca3af"></span>
   <span style="flex:1"></span>
@@ -490,6 +554,10 @@ label{font-size:13px;color:var(--sub)}
    <div style="font-size:12px;font-weight:600;color:#374151;margin-bottom:8px">🌐 인용 출처 TOP <span style="font-weight:400;color:#9ca3af">AI가 참고한 사이트</span></div>
    <div id="dashDom"></div>
   </div>
+ </div>
+ <div style="margin-top:16px">
+  <div style="font-size:12px;font-weight:600;color:#374151;margin-bottom:6px">📈 노출률 추이 <span style="font-weight:400;color:#9ca3af">중앙 DB — 모든 PC 측정 합산</span></div>
+  <div id="dashTrend" style="font-size:12px;color:#9ca3af">불러오는 중...</div>
  </div>
  <div id="dashNote" style="font-size:11px;color:#9ca3af;margin-top:10px"></div>
 </div>
@@ -513,6 +581,7 @@ label{font-size:13px;color:var(--sub)}
 </div>
 
 <div class="card">
+<div id="cattabs" class="row" style="margin-bottom:10px;gap:4px"></div>
 <table id="tbl">
  <thead><tr>
   <th><input type="checkbox" id="chkAll" onclick="toggleAll(this)"></th>
@@ -528,11 +597,88 @@ label{font-size:13px;color:var(--sub)}
 
 <script>
 let STATE=null;
+// ── 카테고리 탭 ──────────────────────────────────────────
+let CATS=['전체'], curCat='전체';
+function renderTabs(){
+  CATS=['전체',...new Set(STATE.questions.map(q=>q.cat))];
+  if(!CATS.includes(curCat))curCat='전체';
+  const el=document.getElementById('cattabs');
+  el.innerHTML=CATS.map((c,i)=>{
+    const n=c==='전체'?STATE.questions.length:STATE.questions.filter(q=>q.cat===c).length;
+    return '<button class="tab'+(c===curCat?' on':'')+'" data-i="'+i+'">'
+      +c.replace(/</g,'&lt;')+' <span>'+n+'</span></button>';
+  }).join('');
+  el.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>{
+    curCat=CATS[+b.dataset.i]; renderTabs(); renderTable(); renderDash();
+  }));
+}
+function visibleQs(){
+  return curCat==='전체'?STATE.questions:STATE.questions.filter(q=>q.cat===curCat);
+}
+
 async function load(){
   STATE = await (await fetch('/api/state')).json();
-  renderSettings(); renderTable(); renderStatus(); renderDash();
+  renderSettings(); renderTabs(); renderTable(); renderStatus(); renderDash();
+  loadTrend(false);
   const t=document.getElementById('dashTime');
   if(t)t.textContent='마지막 갱신 '+new Date().toLocaleTimeString('ko-KR');
+}
+// ── 📈 추이 차트 (중앙 DB) — 60초 캐시 ──
+let TREND=null, trendAt=0;
+async function loadTrend(force){
+  if(!force && TREND && Date.now()-trendAt<60000) { renderTrend(); return; }
+  try{
+    const r=await (await fetch('/api/trend')).json();
+    TREND=r; trendAt=Date.now();
+  }catch(e){ TREND={ok:false,err:'연결 실패'}; }
+  renderTrend();
+}
+function renderTrend(){
+  const el=document.getElementById('dashTrend');
+  if(!el||!TREND)return;
+  if(!TREND.ok){el.innerHTML='⚠ '+(TREND.err||'중앙 DB 연결 안 됨');return;}
+  // 현재 카테고리 필터 + 날짜·엔진별 평균 노출률
+  let rows=TREND.rows||[];
+  if(curCat!=='전체')rows=rows.filter(r=>r.category===curCat);
+  if(!rows.length){el.innerHTML='아직 기록 없음 — 측정하면 자동으로 쌓입니다';return;}
+  const agg={};   // {date:{engine:[rates]}}
+  for(const r of rows){
+    const d=(r.created_at||'').slice(0,10);
+    if(!d||r.expose_rate==null)continue;
+    (((agg[d]=agg[d]||{})[r.engine]=agg[d][r.engine]||[])).push(r.expose_rate);
+  }
+  const dates=Object.keys(agg).sort();
+  const engs={google_aio:['구글 AI개요','#2563eb'],chatgpt:['ChatGPT','#10a37f'],gemini:['Gemini','#7c3aed']};
+  const W=460,H=120,PL=30,PB=18;
+  let svg='<svg width="'+W+'" height="'+H+'" style="background:#fff;border:1px solid #e5e7eb;border-radius:8px">';
+  // y축 눈금 0/50/100
+  for(const v of [0,50,100]){
+    const y=(H-PB)-(v/100)*(H-PB-10);
+    svg+='<line x1="'+PL+'" y1="'+y+'" x2="'+W+'" y2="'+y+'" stroke="#f1f5f9"/>'
+       +'<text x="'+(PL-4)+'" y="'+(y+3)+'" text-anchor="end" font-size="9" fill="#9ca3af">'+v+'</text>';
+  }
+  const x=(i)=>dates.length<2?W/2:PL+8+i*(W-PL-16)/(dates.length-1);
+  const y=(v)=>(H-PB)-(v/100)*(H-PB-10);
+  let legend='';
+  for(const [key,[name,color]] of Object.entries(engs)){
+    const pts=dates.map((d,i)=>{
+      const arr=(agg[d]||{})[key];
+      return arr?{i,v:arr.reduce((a,b)=>a+b,0)/arr.length}:null;
+    }).filter(Boolean);
+    if(!pts.length)continue;
+    svg+='<polyline fill="none" stroke="'+color+'" stroke-width="2" points="'
+       +pts.map(p=>x(p.i)+','+y(p.v)).join(' ')+'"/>';
+    for(const p of pts)svg+='<circle cx="'+x(p.i)+'" cy="'+y(p.v)+'" r="3" fill="'+color+'"/>';
+    legend+='<span style="color:'+color+';margin-right:10px">● '+name+'</span>';
+  }
+  // x축 날짜 (처음/끝만)
+  if(dates.length){
+    svg+='<text x="'+x(0)+'" y="'+(H-4)+'" font-size="9" fill="#9ca3af" text-anchor="middle">'+dates[0].slice(5)+'</text>';
+    if(dates.length>1)svg+='<text x="'+x(dates.length-1)+'" y="'+(H-4)+'" font-size="9" fill="#9ca3af" text-anchor="middle">'+dates[dates.length-1].slice(5)+'</text>';
+  }
+  svg+='</svg>';
+  el.innerHTML=svg+'<div style="margin-top:4px;font-size:11px">'+legend
+    +'<span style="color:#9ca3af">· 총 '+rows.length+'회 측정</span></div>';
 }
 function flashDash(){
   const d=document.getElementById('dash');
@@ -583,7 +729,9 @@ function statCard(n,label,color){
 }
 function renderDash(){
   const dash=document.getElementById('dash');
-  const res=STATE.results, qs=STATE.questions;
+  const res=STATE.results, qs=visibleQs();   // 선택된 카테고리 기준
+  const dc=document.getElementById('dashCat');
+  if(dc)dc.textContent=curCat==='전체'?'':' — '+curCat;
   const own=(STATE.settings.own_domains||[]).map(x=>x.toLowerCase()).filter(Boolean);
   const aliases=(STATE.settings.brand_aliases||[]).map(x=>x.toLowerCase().replace(/\\s+/g,''));
   let measured=0,aioN=0,aioExp=0,gemN=0,gemExp=0,gptN=0,gptExp=0,linkRounds=0;
@@ -722,7 +870,7 @@ function renderTable(){
   const keep=new Set(selIds());          // 다시 그려도 선택 유지
   const keepAll=document.getElementById('chkAll').checked;
   const tb=document.getElementById('tbody'); tb.innerHTML='';
-  for(const q of STATE.questions){
+  for(const q of visibleQs()){
     const rs=STATE.results[q.id]||{};
     const g=rs.google_aio, m=rs.gemini, t=rs.chatgpt;
     if(g)g._qid=q.id; if(m)m._qid=q.id; if(t)t._qid=q.id;
@@ -823,7 +971,7 @@ async function _measure(ids){
   else if(!r.ok)document.getElementById('status').textContent='서버(Gemini) 안 돌아감: '+(r.err||'')+' — 확장(구글AI개요)만 진행';
   load();
 }
-function measureAll(){_measure(STATE.questions.map(q=>q.id));}
+function measureAll(){_measure(visibleQs().map(q=>q.id));}   // 현재 탭 기준
 function measureSel(){const ids=selIds(); if(!ids.length)return alert('질문을 선택하세요'); _measure(ids);}
 function measureOne(id){_measure([id]);}
 async function stopRun(){
