@@ -6,7 +6,7 @@ function refresh() {
     const el = $("status");
     if (run.active) {
       el.className = "on";
-      el.textContent = "측정 중 [" + run.i + "/" + run.n + "] R" + run.round + "/" + run.rt + " — " + run.msg;
+      el.textContent = "측정 중 [" + run.i + "/" + run.n + "] " + run.msg;
     } else {
       el.className = "";
       el.textContent = run.msg || "대기 중";

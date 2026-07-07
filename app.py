@@ -1064,7 +1064,7 @@ function renderExtStatus(){
   if(!extReady){el.textContent='🧩 확장: 연결 안 됨 — 확장 설치 후 이 페이지 새로고침';el.style.color='#6b7280';return;}
   if(extRun&&extRun.active){
     el.style.color='#2563eb';
-    el.textContent='🧩 구글AI개요(확장) 측정 중 ['+extRun.i+'/'+extRun.n+'] R'+extRun.round+'/'+extRun.rt+' — '+extRun.msg;
+    el.textContent='🧩 측정 중 ['+extRun.i+'/'+extRun.n+'] '+extRun.msg;
   } else {
     el.style.color='#059669';
     el.textContent='🧩 확장 연결됨'+(extVer?' (v'+extVer+')':'')

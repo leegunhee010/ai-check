@@ -50,13 +50,19 @@ async function startRun(repeats, onlyIds, incognito) {
       const q = qs[qi];
       run.i = qi + 1;
 
-      // ── 엔진 1: 구글 AI 개요 (설정에서 켰을 때만) ──
-      if (useAio) {
-        run.msg = "[AI개요] " + q.q;
+      // ── 3개 엔진 동시 실행 (질문당 시간 = 제일 느린 엔진 하나) ──
+      const eng = {};
+      const setMsg = () => {
+        run.msg = Object.values(eng).join(" · ") + " — " + q.q.slice(0, 40);
+      };
+
+      const tasks = [];
+
+      if (useAio) tasks.push((async () => {
         const rounds = [];
         for (let r = 0; r < repeats; r++) {
           if (run.stop) break;
-          run.round = r + 1;
+          eng.aio = "AI개요 " + (r + 1) + "/" + repeats; setMsg();
           const res = await searchOnce(q.q, incognito);
           rounds.push(res);
           if (res.error && res.error.includes("시크릿")) {
@@ -64,53 +70,50 @@ async function startRun(repeats, onlyIds, incognito) {
             run.stop = true;
             break;
           }
-          if (r < repeats - 1 && !(await waitOrStop(8000 + Math.random() * 7000))) break; // 라운드 간 8~15초
+          if (r < repeats - 1 && !(await waitOrStop(8000 + Math.random() * 7000))) break; // 라운드 간 8~15초 (구글 배려)
         }
+        eng.aio = "AI개요 ✓"; setMsg();
         if (rounds.length) await post(q.id, rounds, "google_aio");
-      }
+      })());
 
-      // ── 엔진 2: ChatGPT (임시채팅 — 메모리 오염 없음) ──
-      if (useGpt && !run.stop) {
-        run.msg = "[ChatGPT] " + q.q;
-        const gptRounds = [];
-        let gptFatal = false;
+      if (useGpt) tasks.push((async () => {
+        const rounds = [];
         for (let r = 0; r < repeats; r++) {
           if (run.stop) break;
-          run.round = r + 1;
+          eng.gpt = "GPT " + (r + 1) + "/" + repeats; setMsg();
           const res = await searchOnceGpt(q.q);
-          gptRounds.push(res);
+          rounds.push(res);
           if (res.error && (res.error.includes("로그인") || res.error.includes("차단"))) {
-            run.msg = "ChatGPT: " + res.error;
             if (!warns.some((w) => w.startsWith("ChatGPT"))) warns.push("ChatGPT: " + res.error.split("—")[0].trim());
-            gptFatal = true;             // 로그인/차단이면 반복해봐야 소용없음
-            break;
+            break;                          // 로그인/차단이면 반복해봐야 소용없음
           }
-          if (r < repeats - 1 && !(await waitOrStop(6000 + Math.random() * 6000))) break;
+          if (r < repeats - 1 && !(await waitOrStop(5000 + Math.random() * 5000))) break;
         }
-        if (gptRounds.length) await post(q.id, gptRounds, "chatgpt");
-        if (gptFatal) { /* AI개요는 계속 진행 */ }
-      }
+        eng.gpt = "GPT ✓"; setMsg();
+        if (rounds.length) await post(q.id, rounds, "chatgpt");
+      })());
 
-      // ── 엔진 3: Gemini 웹 (구글 로그인 세션) ──
-      if (useGemWeb && !run.stop) {
-        run.msg = "[Gemini] " + q.q;
-        const gemRounds = [];
+      if (useGemWeb) tasks.push((async () => {
+        const rounds = [];
         for (let r = 0; r < repeats; r++) {
           if (run.stop) break;
-          run.round = r + 1;
+          eng.gem = "Gemini " + (r + 1) + "/" + repeats; setMsg();
           const res = await searchOnceGem(q.q);
-          gemRounds.push(res);
+          rounds.push(res);
           if (res.error && res.error.includes("로그인")) {
-            run.msg = res.error;
             if (!warns.some((w) => w.startsWith("Gemini"))) warns.push("Gemini: 구글 로그인 필요");
             break;
           }
-          if (r < repeats - 1 && !(await waitOrStop(6000 + Math.random() * 6000))) break;
+          if (r < repeats - 1 && !(await waitOrStop(5000 + Math.random() * 5000))) break;
         }
-        if (gemRounds.length) await post(q.id, gemRounds, "gemini");
-      }
+        eng.gem = "Gemini ✓"; setMsg();
+        if (rounds.length) await post(q.id, rounds, "gemini");
+      })());
 
-      if (qi < qs.length - 1 && !(await waitOrStop(10000 + Math.random() * 10000))) { run.msg = "중단됨"; break; } // 질문 간 10~20초
+      await Promise.all(tasks);            // 세 엔진 다 끝나면 다음 질문
+
+      if (run.stop) { run.msg = "중단됨"; break; }
+      if (qi < qs.length - 1 && !(await waitOrStop(8000 + Math.random() * 7000))) { run.msg = "중단됨"; break; } // 질문 간 8~15초
     }
     if (!run.stop) {
       run.msg = warns.length
@@ -183,7 +186,14 @@ async function searchOnce(query, incognito) {
 }
 
 // ── 증거 캡처 공용: 창을 0.3초만 앞으로 → 찍고 → 원래 창 복귀 ──
-async function captureWin(winId) {
+// 병렬 측정 시 캡처가 겹치면 포커스 싸움이 나므로 한 번에 하나씩(뮤텍스)
+let _capQ = Promise.resolve();
+function captureWin(winId) {
+  const job = _capQ.then(() => _captureWinNow(winId), () => _captureWinNow(winId));
+  _capQ = job.catch(() => {});
+  return job;
+}
+async function _captureWinNow(winId) {
   let prev = null;
   try { prev = await chrome.windows.getLastFocused(); } catch (e) {}
   await chrome.windows.update(winId, { focused: true });
