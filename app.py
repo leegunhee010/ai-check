@@ -79,11 +79,13 @@ def _supa_cfg():
     return (s.get("supabase_url") or SUPABASE_URL), (s.get("supabase_key") or SUPABASE_KEY)
 
 
-def _supa(method, path, body=None, timeout=12):
+def _supa(method, path, body=None, timeout=12, prefer=None):
     url, key = _supa_cfg()
     h = {"apikey": key, "Authorization": "Bearer " + key,
          "Content-Type": "application/json"}
-    if method == "POST":
+    if prefer:
+        h["Prefer"] = prefer
+    elif method == "POST":
         h["Prefer"] = "return=minimal"
     req = urllib.request.Request(
         url + path,
@@ -98,13 +100,98 @@ def _supa(method, path, body=None, timeout=12):
 
 
 def _supa_push(question, cat, engine_key, res):
-    """측정 결과 요약을 중앙 DB에 기록 (백그라운드)"""
+    """측정 결과 요약을 중앙 DB에 기록 — 추이용 append 로그 (백그라운드)"""
     st = load_settings()
     row = {"device": DEVICE, "brand": st["brand_name"], "category": cat,
            "question": question, "engine": engine_key,
            "n": res.get("n", 0), "aio_rate": res.get("aio_rate"),
            "expose_rate": res.get("expose_rate"), "avg_rank": res.get("avg_rank")}
     _supa("POST", "/rest/v1/ai_measurements", row)
+
+
+def _supa_push_result(qid, engine_key, res):
+    """최신 상세 결과를 중앙에 upsert — 모든 PC가 같은 표를 보게"""
+    st = load_settings()
+    _supa("POST", "/rest/v1/ai_results?on_conflict=brand,question_id,engine",
+          {"brand": st["brand_name"], "question_id": qid, "engine": engine_key,
+           "ts": res.get("ts", ""), "data": res,
+           "updated_at": datetime.datetime.utcnow().isoformat() + "Z"},
+          prefer="resolution=merge-duplicates,return=minimal")
+
+
+# ── 중앙 동기화: 질문 목록 + 결과를 모든 PC가 공유 ─────────────
+_SYNC = {"t": 0.0, "ok": None}
+
+
+def sync_central(force=False):
+    """중앙 질문/결과 풀 + 로컬에만 있는 질문 업로드. 15초 캐시.
+    오프라인/테이블 없으면 조용히 로컬 모드로 동작."""
+    now = time.time()
+    if not force and now - _SYNC["t"] < 15:
+        return _SYNC["ok"]
+    _SYNC["t"] = now
+    st = load_settings()
+    brand = urllib.parse.quote(st["brand_name"])
+
+    central = _supa("GET", "/rest/v1/ai_questions?select=id,cat,q"
+                    "&brand=eq." + brand + "&order=id.asc&limit=5000")
+    if central is None:
+        _SYNC["ok"] = False
+        return False
+
+    with _lock:
+        data = load_data()
+        by_text = {r["q"]: r for r in central}
+        # ① 로컬에만 있는 질문 → 중앙 업로드 (기존 사용자 자동 마이그레이션)
+        for q in data["questions"]:
+            if q["q"] not in by_text:
+                ins = _supa("POST",
+                            "/rest/v1/ai_questions?on_conflict=brand,q",
+                            {"brand": st["brand_name"], "cat": q["cat"], "q": q["q"]},
+                            prefer="resolution=merge-duplicates,return=representation")
+                if isinstance(ins, list) and ins:
+                    by_text[q["q"]] = ins[0]
+        # ② 새 질문 목록 = 중앙 기준 (id도 중앙 id)
+        new_qs = [{"id": r["id"], "cat": r.get("cat") or "기본", "q": r["q"]}
+                  for r in sorted(by_text.values(), key=lambda x: x["id"])]
+        # ③ 로컬 결과의 옛 id → 중앙 id로 이관 (질문 텍스트 매칭)
+        old_text = {str(q["id"]): q["q"] for q in data["questions"]}
+        new_id = {q["q"]: q["id"] for q in new_qs}
+        new_results = {}
+        for old_qid, engines in data["results"].items():
+            qtext = old_text.get(str(old_qid))
+            nid = new_id.get(qtext)
+            if nid is not None:
+                new_results[str(nid)] = engines
+        # ④ 중앙 결과 병합 (같은 질문·엔진이면 최신 ts 승 — 로컬이 최신이면 유지)
+        rows = _supa("GET", "/rest/v1/ai_results?select=question_id,engine,ts,data"
+                     "&brand=eq." + brand + "&limit=5000") or []
+        central_res = {}
+        for r in rows:
+            qid = str(r["question_id"])
+            eng = r["engine"]
+            central_res[(qid, eng)] = r
+            local = new_results.get(qid, {}).get(eng)
+            if local is None or (r.get("ts") or "") > (local.get("ts") or ""):
+                new_results.setdefault(qid, {})[eng] = r.get("data") or {}
+        # ⑤ 로컬이 더 최신이거나 중앙에 없는 결과 → 역업로드 (오프라인 측정분 복구)
+        upload = []
+        for qid, engines in new_results.items():
+            for eng, res in engines.items():
+                c = central_res.get((qid, eng))
+                if c is None or (res.get("ts") or "") > (c.get("ts") or ""):
+                    upload.append((qid, eng, res))
+        data["questions"] = new_qs
+        data["results"] = new_results
+        jsave(DATA_FILE, data)
+    # 업로드는 락 밖에서 (네트워크가 느려도 UI 안 막게)
+    for qid, eng, res in upload:
+        try:
+            _supa_push_result(int(qid), eng, res)
+        except Exception:
+            pass
+    _SYNC["ok"] = True
+    return True
 
 
 # ── 측정 실행 상태 (스레드 1개만) ─────────────────────────────
@@ -122,11 +209,13 @@ def _save_result(qid, engine_key, res):
         data = load_data()
         data["results"].setdefault(str(qid), {})[engine_key] = res
         jsave(DATA_FILE, data)
-    # 중앙 DB로 요약 전송 (실패해도 무시 — 로컬 저장은 위에서 완료)
+    # 중앙 DB로 전송 (실패해도 무시 — 로컬 저장은 위에서 완료)
     cat = next((q["cat"] for q in data["questions"] if q["id"] == qid), "")
-    threading.Thread(target=_supa_push,
-                     args=(res.get("question", ""), cat, engine_key, dict(res)),
-                     daemon=True).start()
+
+    def _push():
+        _supa_push(res.get("question", ""), cat, engine_key, dict(res))   # 추이 로그
+        _supa_push_result(qid, engine_key, dict(res))                     # 최신 결과 공유
+    threading.Thread(target=_push, daemon=True).start()
 
 
 def _worker(q_ids):
@@ -172,9 +261,11 @@ def _worker(q_ids):
 # ── API ───────────────────────────────────────────────────────
 @app.get("/api/state")
 def api_state():
+    sync_central()                      # 15초마다 중앙과 동기화 (오프라인이면 로컬)
     data = load_data()
     return jsonify({"questions": data["questions"], "results": data["results"],
-                    "settings": load_settings(), "run": RUN})
+                    "settings": load_settings(), "run": RUN,
+                    "central": _SYNC["ok"]})
 
 
 @app.post("/api/questions")
@@ -182,24 +273,41 @@ def api_add_q():
     body = request.get_json(force=True)
     lines = [l.strip() for l in str(body.get("q", "")).splitlines() if l.strip()]
     cat = str(body.get("cat", "")).strip() or "기본"
-    with _lock:
-        data = load_data()
-        for line in lines:
-            data["questions"].append({"id": data["next_id"], "cat": cat, "q": line})
-            data["next_id"] += 1
-        jsave(DATA_FILE, data)
+    st = load_settings()
+    central_ok = True
+    for line in lines:
+        r = _supa("POST", "/rest/v1/ai_questions?on_conflict=brand,q",
+                  {"brand": st["brand_name"], "cat": cat, "q": line},
+                  prefer="resolution=merge-duplicates,return=minimal")
+        if r is None:
+            central_ok = False
+    if central_ok:
+        sync_central(force=True)        # 중앙 반영분 즉시 내려받기
+    else:
+        # 오프라인 폴백: 로컬에만 저장 (다음 동기화 때 자동 업로드됨)
+        with _lock:
+            data = load_data()
+            for line in lines:
+                data["questions"].append({"id": data["next_id"], "cat": cat, "q": line})
+                data["next_id"] += 1
+            jsave(DATA_FILE, data)
     return jsonify(ok=True)
 
 
 @app.post("/api/questions/delete")
 def api_del_q():
     ids = set(request.get_json(force=True).get("ids", []))
+    # 중앙에서 삭제 (질문 + 그 결과) — 모든 PC에서 사라짐
+    for i in ids:
+        _supa("DELETE", "/rest/v1/ai_questions?id=eq.%s" % i)
+        _supa("DELETE", "/rest/v1/ai_results?question_id=eq.%s" % i)
     with _lock:
         data = load_data()
         data["questions"] = [q for q in data["questions"] if q["id"] not in ids]
         for i in ids:
             data["results"].pop(str(i), None)
         jsave(DATA_FILE, data)
+    sync_central(force=True)
     return jsonify(ok=True)
 
 
@@ -355,7 +463,9 @@ a{color:#2563eb}
         if rd.get("shot"):
             n_shown += 1
             parts.append('<div class="shot"><div class="shead">라운드 %d %s</div>'
-                         '<img src="/shots/%s" loading="lazy"></div>' % (i, badge, rd["shot"]))
+                         '<img src="/shots/%s" loading="lazy" '
+                         'onerror="this.outerHTML=\'<i style=color:#9ca3af>캡처 파일은 측정한 PC에만 저장돼 있습니다</i>\'"></div>'
+                         % (i, badge, rd["shot"]))
         else:
             reason = rd.get("shot_err") or ("측정 시 캡처 미지원 버전" if rd.get("shown") else "AI 답변 없음")
             parts.append('<div class="shot"><div class="shead">라운드 %d %s '
@@ -578,6 +688,7 @@ label{font-size:13px;color:var(--sub)}
  </div>
  <div id="status" style="margin-top:8px">대기 중</div>
  <div id="extstatus" style="margin-top:4px;font-size:13px;color:#6b7280">🧩 확장: 연결 안 됨 — 확장 설치 후 이 페이지 새로고침</div>
+ <div id="syncstatus" style="margin-top:4px;font-size:13px;color:#6b7280">☁ 중앙 동기화 확인 중...</div>
 </div>
 
 <div class="card">
@@ -622,6 +733,11 @@ async function load(){
   loadTrend(false);
   const t=document.getElementById('dashTime');
   if(t)t.textContent='마지막 갱신 '+new Date().toLocaleTimeString('ko-KR');
+  const sy=document.getElementById('syncstatus');
+  if(sy){
+    if(STATE.central===true){sy.style.color='#059669';sy.textContent='☁ 중앙 동기화 ON — 모든 PC가 같은 질문·결과를 봅니다';}
+    else if(STATE.central===false){sy.style.color='#d97706';sy.textContent='☁ 중앙 DB 연결 안 됨 — 로컬 모드 (테이블 미생성 또는 오프라인)';}
+  }
 }
 // ── 📈 추이 차트 (중앙 DB) — 60초 캐시 ──
 let TREND=null, trendAt=0;
