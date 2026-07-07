@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI개요 체크 (AI노출체크 연동)",
-  "version": "2.0",
+  "version": "2.2",
   "description": "AI노출체크 프로그램(127.0.0.1:5630)의 질문을 이 크롬에서 검색해 구글 AI 개요 노출을 측정합니다.",
   "permissions": ["tabs", "scripting", "storage"],
   "host_permissions": [

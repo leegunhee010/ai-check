@@ -137,7 +137,13 @@ async function searchOnce(query, incognito) {
       return { shown: false, text: "",
         error: "시크릿 창 생성 실패 — chrome://extensions → AI개요 체크 → 세부정보 → '시크릿 모드에서 허용'을 켜주세요 (" + String(e).slice(0, 80) + ")" };
     }
-    const tabId = win.tabs && win.tabs[0] ? win.tabs[0].id : null;
+    let tabId = win && win.tabs && win.tabs[0] ? win.tabs[0].id : null;
+    if (win && tabId == null) {
+      try {
+        const tabs = await chrome.tabs.query({ windowId: win.id });
+        tabId = tabs[0] ? tabs[0].id : null;
+      } catch (e) {}
+    }
     try {
       if (tabId == null) throw new Error("시크릿 탭 없음 — '시크릿 모드에서 허용' 확인");
       await waitLoad(tabId);
@@ -145,7 +151,7 @@ async function searchOnce(query, incognito) {
         target: { tabId }, func: extractAio,
       });
       const res = inj?.result || { shown: false, text: "" };
-      if (res.shown) {
+      if (res.shown && win) {
         try { res.shot = await captureWin(win.id); }
         catch (e) { res.shot_err = String(e).slice(0, 100); }
       }
@@ -189,27 +195,50 @@ async function captureWin(winId) {
   return shot;
 }
 
+// ── 작업 창/탭 열기 공용: 창 생성이 null이면 일반 탭으로 폴백 ──
+async function openWork(url) {
+  try {
+    const win = await chrome.windows.create({ url, focused: false,
+      width: 1280, height: 1000, left: 60, top: 60 });
+    if (win) {
+      let tabId = win.tabs && win.tabs[0] ? win.tabs[0].id : null;
+      if (tabId == null) {
+        try {
+          const tabs = await chrome.tabs.query({ windowId: win.id });
+          tabId = tabs[0] ? tabs[0].id : null;
+        } catch (e) {}
+      }
+      if (tabId != null) {
+        return { tabId, winId: win.id,
+                 close: async () => { try { await chrome.windows.remove(win.id); } catch (e) {} } };
+      }
+      try { await chrome.windows.remove(win.id); } catch (e) {}
+    }
+  } catch (e) {}
+  // 폴백: 현재 창의 백그라운드 탭 (캡처만 안 될 뿐 측정은 됨)
+  const tab = await chrome.tabs.create({ url, active: false });
+  return { tabId: tab.id, winId: null,
+           close: async () => { try { await chrome.tabs.remove(tab.id); } catch (e) {} } };
+}
+
 // ── Gemini 웹: 별도 창 열어 입력창에 질문 → 답변 대기 → 추출+캡처 ──
 async function searchOnceGem(query) {
-  const win = await chrome.windows.create({ url: "https://gemini.google.com/app",
-    focused: false, width: 1280, height: 1000, left: 60, top: 60 });
-  const tabId = win.tabs && win.tabs[0] ? win.tabs[0].id : null;
+  const w = await openWork("https://gemini.google.com/app");
   try {
-    if (tabId == null) throw new Error("탭 없음");
-    await waitLoad(tabId);
+    await waitLoad(w.tabId);
     const [inj] = await chrome.scripting.executeScript({
-      target: { tabId }, func: extractGem, args: [query],
+      target: { tabId: w.tabId }, func: extractGem, args: [query],
     });
     const res = inj?.result || { shown: false, text: "", error: "결과 없음" };
-    if (res.shown) {
-      try { res.shot = await captureWin(win.id); }
+    if (res.shown && w.winId != null) {
+      try { res.shot = await captureWin(w.winId); }
       catch (e) { res.shot_err = String(e).slice(0, 100); }
     }
     return res;
   } catch (e) {
     return { shown: false, text: "", error: String(e).slice(0, 150) };
   } finally {
-    try { await chrome.windows.remove(win.id); } catch (e) {}
+    await w.close();
   }
 }
 
@@ -292,25 +321,22 @@ async function extractGem(query) {
 // ── ChatGPT: 임시채팅 별도 창 열어 질문 → 답변 대기 → 추출+캡처 ──
 async function searchOnceGpt(query) {
   const url = "https://chatgpt.com/?temporary-chat=true&q=" + encodeURIComponent(query);
-  const win = await chrome.windows.create({ url, focused: false,
-    width: 1280, height: 1000, left: 60, top: 60 });
-  const tabId = win.tabs && win.tabs[0] ? win.tabs[0].id : null;
+  const w = await openWork(url);
   try {
-    if (tabId == null) throw new Error("탭 없음");
-    await waitLoad(tabId);
+    await waitLoad(w.tabId);
     const [inj] = await chrome.scripting.executeScript({
-      target: { tabId }, func: extractGpt,
+      target: { tabId: w.tabId }, func: extractGpt,
     });
     const res = inj?.result || { shown: false, text: "", error: "결과 없음" };
-    if (res.shown) {
-      try { res.shot = await captureWin(win.id); }
+    if (res.shown && w.winId != null) {
+      try { res.shot = await captureWin(w.winId); }
       catch (e) { res.shot_err = String(e).slice(0, 100); }
     }
     return res;
   } catch (e) {
     return { shown: false, text: "", error: String(e).slice(0, 150) };
   } finally {
-    try { await chrome.windows.remove(win.id); } catch (e) {}
+    await w.close();
   }
 }
 
